@@ -4,17 +4,16 @@ import (
     "database/sql"
     "encoding/json"
     "fmt"
-    "io/ioutil"
     "log"
     "os"
     "path/filepath"
     "time"
 
-    _ "github.com/godror/godror"
+    _ "github.com/sijms/go-ora/v2"
 )
 
 type Config struct {
-    OracleDSN string `json:"oracle_dsn"`
+    OracleDSN string `json:"oracle_dsn"` // Format: oracle://user:pass@host:port/service_name
 }
 
 const (
@@ -29,7 +28,7 @@ func main() {
         log.Fatalf("Failed to load config: %v", err)
     }
 
-    db, err := sql.Open("godror", config.OracleDSN)
+    db, err := sql.Open("oracle", config.OracleDSN)
     if err != nil {
         log.Fatalf("Failed to connect to Oracle DB: %v", err)
     }
@@ -42,13 +41,13 @@ func main() {
 }
 
 func loadConfig(filename string) (*Config, error) {
-    file, err := ioutil.ReadFile(filename)
+    data, err := os.ReadFile(filename)
     if err != nil {
         return nil, err
     }
 
     var config Config
-    err = json.Unmarshal(file, &config)
+    err = json.Unmarshal(data, &config)
     if err != nil {
         return nil, err
     }
