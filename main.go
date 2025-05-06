@@ -7,6 +7,7 @@ import (
     "log"
     "os"
     "path/filepath"
+    "sort"
     "strings"
     "time"
 
@@ -14,7 +15,7 @@ import (
 )
 
 type Config struct {
-    OracleDSN string `json:"oracle_dsn"` // Format: oracle://user:pass@host:port/service_name
+    OracleDSN string `json:"oracle_dsn"`
 }
 
 const (
@@ -36,7 +37,10 @@ func main() {
     defer db.Close()
 
     for {
-        scanAndStoreFiles(db, watchDir)
+        err := scanAndStoreFiles(db, watchDir)
+        if err != nil {
+            log.Printf("Scan error: %v", err)
+        }
         time.Sleep(scanInterval)
     }
 }
@@ -56,12 +60,16 @@ func loadConfig(filename string) (*Config, error) {
     return &config, nil
 }
 
-func scanAndStoreFiles(db *sql.DB, dir string) {
-    err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+func scanAndStoreFiles(db *sql.DB, dir string) error {
+    typeMap, err := loadTypePrefixMap(db)
+    if err != nil {
+        return fmt.Errorf("failed to load type prefixes: %w", err)
+    }
+
+    return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
         if err != nil {
             return err
         }
-
         if info.IsDir() {
             return nil
         }
@@ -70,56 +78,76 @@ func scanAndStoreFiles(db *sql.DB, dir string) {
         if err != nil {
             return err
         }
-
-        if !exists {
-            prefix := getFilePrefix(info.Name())
-            typeID, err := lookupTypeID(db, prefix)
-            if err != nil {
-                log.Printf("Skipping file %s due to type lookup error: %v", info.Name(), err)
-                return nil
-            }
-
-            insertFile(db, info.Name(), path, info.Size(), info.ModTime(), typeID)
-            fmt.Printf("New file added: %s (type_id: %d)\n", path, typeID)
+        if exists {
+            return nil
         }
 
+        typeID := matchPrefixToTypeID(info.Name(), typeMap)
+        if typeID == 0 {
+            log.Printf("No matching prefix for file: %s (skipped)", info.Name())
+            return nil
+        }
+
+        insertFile(db, info.Name(), path, info.Size(), info.ModTime(), typeID)
+        fmt.Printf("Inserted: %s [type_id: %d]\n", path, typeID)
         return nil
     })
-
-    if err != nil {
-        log.Printf("Error scanning directory: %v", err)
-    }
 }
 
-func getFilePrefix(filename string) string {
-    name := strings.ToLower(filename)
-    if len(name) >= 5 {
-        return name[:5]
+func loadTypePrefixMap(db *sql.DB) map[string]int {
+    rows, err := db.Query(`SELECT prefix, id FROM file_types`)
+    if err != nil {
+        log.Fatalf("Query failed: %v", err)
     }
-    return name
+    defer rows.Close()
+
+    typeMap := make(map[string]int)
+    for rows.Next() {
+        var prefix string
+        var id int
+        if err := rows.Scan(&prefix, &id); err != nil {
+            log.Printf("Skipping row: %v", err)
+            continue
+        }
+        typeMap[strings.ToLower(prefix)] = id
+    }
+
+    return typeMap
 }
 
-func lookupTypeID(db *sql.DB, prefix string) (int, error) {
-    var id int
-    query := `SELECT id FROM file_types WHERE prefix = :1`
-    err := db.QueryRow(query, prefix).Scan(&id)
-    if err != nil {
-        return 0, err
+func matchPrefixToTypeID(filename string, typeMap map[string]int) int {
+    filename = strings.ToLower(filename)
+
+    // Sort prefixes by length descending to prioritize longest match
+    prefixes := make([]string, 0, len(typeMap))
+    for prefix := range typeMap {
+        prefixes = append(prefixes, prefix)
     }
-    return id, nil
+    sort.Slice(prefixes, func(i, j int) bool {
+        return len(prefixes[i]) > len(prefixes[j])
+    })
+
+    for _, prefix := range prefixes {
+        if strings.HasPrefix(filename, prefix) {
+            return typeMap[prefix]
+        }
+    }
+
+    return 0 // no match
 }
 
 func fileExistsInDB(db *sql.DB, path string) (bool, error) {
     var exists int
-    query := `SELECT COUNT(1) FROM files WHERE path = :1`
-    err := db.QueryRow(query, path).Scan(&exists)
+    err := db.QueryRow(`SELECT COUNT(1) FROM files WHERE path = :1`, path).Scan(&exists)
     return exists > 0, err
 }
 
 func insertFile(db *sql.DB, name, path string, size int64, modTime time.Time, typeID int) {
-    query := `INSERT INTO files (name, path, size, mod_time, type_id) VALUES (:1, :2, :3, :4, :5)`
-    _, err := db.Exec(query, name, path, size, modTime, typeID)
+    _, err := db.Exec(
+        `INSERT INTO files (name, path, size, mod_time, type_id) VALUES (:1, :2, :3, :4, :5)`,
+        name, path, size, modTime, typeID,
+    )
     if err != nil {
-        log.Printf("Failed to insert file: %v", err)
+        log.Printf("Failed to insert file %s: %v", name, err)
     }
 }
