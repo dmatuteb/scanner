@@ -7,6 +7,7 @@ import (
     "log"
     "os"
     "path/filepath"
+    "strings"
     "time"
 
     _ "github.com/sijms/go-ora/v2"
@@ -71,8 +72,15 @@ func scanAndStoreFiles(db *sql.DB, dir string) {
         }
 
         if !exists {
-            insertFile(db, info.Name(), path, info.Size(), info.ModTime())
-            fmt.Printf("New file added to DB: %s\n", path)
+            prefix := getFilePrefix(info.Name())
+            typeID, err := lookupTypeID(db, prefix)
+            if err != nil {
+                log.Printf("Skipping file %s due to type lookup error: %v", info.Name(), err)
+                return nil
+            }
+
+            insertFile(db, info.Name(), path, info.Size(), info.ModTime(), typeID)
+            fmt.Printf("New file added: %s (type_id: %d)\n", path, typeID)
         }
 
         return nil
@@ -83,6 +91,24 @@ func scanAndStoreFiles(db *sql.DB, dir string) {
     }
 }
 
+func getFilePrefix(filename string) string {
+    name := strings.ToLower(filename)
+    if len(name) >= 5 {
+        return name[:5]
+    }
+    return name
+}
+
+func lookupTypeID(db *sql.DB, prefix string) (int, error) {
+    var id int
+    query := `SELECT id FROM file_types WHERE prefix = :1`
+    err := db.QueryRow(query, prefix).Scan(&id)
+    if err != nil {
+        return 0, err
+    }
+    return id, nil
+}
+
 func fileExistsInDB(db *sql.DB, path string) (bool, error) {
     var exists int
     query := `SELECT COUNT(1) FROM files WHERE path = :1`
@@ -90,9 +116,9 @@ func fileExistsInDB(db *sql.DB, path string) (bool, error) {
     return exists > 0, err
 }
 
-func insertFile(db *sql.DB, name, path string, size int64, modTime time.Time) {
-    query := `INSERT INTO files (name, path, size, mod_time) VALUES (:1, :2, :3, :4)`
-    _, err := db.Exec(query, name, path, size, modTime)
+func insertFile(db *sql.DB, name, path string, size int64, modTime time.Time, typeID int) {
+    query := `INSERT INTO files (name, path, size, mod_time, type_id) VALUES (:1, :2, :3, :4, :5)`
+    _, err := db.Exec(query, name, path, size, modTime, typeID)
     if err != nil {
         log.Printf("Failed to insert file: %v", err)
     }
