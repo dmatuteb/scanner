@@ -1,0 +1,9 @@
+{
+  "oracle_dsn": "oracle://usuario:contraseña@host:puerto/sid",
+  "ssh_user": "usuario_aix",
+  "ssh_password": "tu_contraseña",
+  "ssh_host": "aix.ejemplo.com",
+  "ssh_port": 22,
+  "watch_dir": "/ruta/remota/a/escanear",
+  "scan_interval_hours": 24
+}
