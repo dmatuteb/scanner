@@ -31,6 +31,8 @@ var (
 )
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	config, err := loadConfig("config.json")
 	if err != nil {
 		log.Fatalf("Error cargando configuración: %v", err)
@@ -38,11 +40,11 @@ func main() {
 
 	db, err := sql.Open("oracle", config.OracleDSN)
 	if err != nil {
-		log.Fatalf("Error conectando a la base de datos Oracle: %v", err)
+		log.Fatalf("Error conectando a Oracle DB: %v", err)
 	}
 	defer db.Close()
 
-	if err := connectSSH(config.SSHUser, config.SSHPassword, config.SSHHost, config.SSHPort); err != nil {
+	if err := connectSSH(config); err != nil {
 		log.Fatalf("Error conectando vía SSH: %v", err)
 	}
 	defer closeSSH()
@@ -70,41 +72,36 @@ func loadConfig(filename string) (*Config, error) {
 		return nil, err
 	}
 
-	// Valores por defecto si no vienen en el JSON
 	if config.SSHPort == 0 {
 		config.SSHPort = 22
-	}
-	if config.WatchDir == "" {
-		config.WatchDir = "./watch_folder"
 	}
 	if config.ScanInterval == 0 {
 		config.ScanInterval = 24
 	}
-
 	return &config, nil
 }
 
-func connectSSH(user, password, host string, port int) error {
-	config := &ssh.ClientConfig{
-		User: user,
+func connectSSH(cfg *Config) error {
+	sshConf := &ssh.ClientConfig{
+		User: cfg.SSHUser,
 		Auth: []ssh.AuthMethod{
-			ssh.Password(password),
+			ssh.Password(cfg.SSHPassword),
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * time.Second,
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
-	client, err := ssh.Dial("tcp", addr, config)
+	addr := fmt.Sprintf("%s:%d", cfg.SSHHost, cfg.SSHPort)
+	client, err := ssh.Dial("tcp", addr, sshConf)
 	if err != nil {
-		return fmt.Errorf("no se pudo conectar al servidor SSH: %w", err)
+		return err
 	}
 	sshClient = client
 
 	sftpC, err := sftp.NewClient(client)
 	if err != nil {
-		sshClient.Close()
-		return fmt.Errorf("no se pudo crear cliente SFTP: %w", err)
+		client.Close()
+		return err
 	}
 	sftpClient = sftpC
 	return nil
@@ -120,50 +117,47 @@ func closeSSH() {
 }
 
 func scanAndStoreFiles(db *sql.DB, remoteDir string) error {
-	typeMap, err := loadTypePrefixMap(db)
-	if err != nil {
-		return fmt.Errorf("no se pudieron cargar los prefijos de tipo: %w", err)
-	}
+	typeMap := loadTypePrefixMap(db)
 
 	walker := sftpClient.Walk(remoteDir)
 	for walker.Step() {
 		if err := walker.Err(); err != nil {
-			return err
+			log.Println("Error en walker:", err)
+			continue
 		}
-
-		fi := walker.Stat()
-		if fi.IsDir() {
+		info := walker.Stat()
+		if info.IsDir() {
 			continue
 		}
 
+		name := info.Name()
 		path := walker.Path()
-		exists, err := fileExistsInDB(db, path)
+
+		exists, err := fileExistsInDB(db, name)
 		if err != nil {
-			return err
+			log.Println("Error verificando existencia:", err)
+			continue
 		}
 		if exists {
 			continue
 		}
 
-		typeID := matchPrefixToTypeID(fi.Name(), typeMap)
+		typeID := matchPrefixToTypeID(name, typeMap)
 		if typeID == 0 {
-			log.Printf("No se encontró prefijo coincidente para el archivo: %s (omitido)", fi.Name())
+			log.Printf("No se encontró prefijo para el archivo: %s (omitido)", name)
 			continue
 		}
 
-		modTime := fi.ModTime()
-		size := fi.Size()
-
-		insertFile(db, fi.Name(), path, size, modTime, typeID)
+		insertFile(db, name, info.ModTime(), typeID)
 		fmt.Printf("Insertado: %s [tipo_id: %d]\n", path, typeID)
 	}
 	return nil
 }
 
-func loadTypePrefixMap(db *sql.DB) (map[string]int, error) {
-	rows, err := db.Query(`SELECT prefix, id FROM file_types`)
+func loadTypePrefixMap(db *sql.DB) map[string]int {
+	rows, err := db.Query(`SELECT PREFIJO, ID FROM ORA_BANK.ACH_TIPO_ARCHIVO_REPROCESO`)
 	if err != nil {
-		return nil, fmt.Errorf("error en consulta: %w", err)
+		log.Fatalf("Consulta fallida: %v", err)
 	}
 	defer rows.Close()
 
@@ -172,13 +166,12 @@ func loadTypePrefixMap(db *sql.DB) (map[string]int, error) {
 		var prefix string
 		var id int
 		if err := rows.Scan(&prefix, &id); err != nil {
-			log.Printf("Fila omitida: %v", err)
+			log.Printf("Error al leer fila: %v", err)
 			continue
 		}
 		typeMap[strings.ToLower(prefix)] = id
 	}
-
-	return typeMap, nil
+	return typeMap
 }
 
 func matchPrefixToTypeID(filename string, typeMap map[string]int) int {
@@ -197,23 +190,19 @@ func matchPrefixToTypeID(filename string, typeMap map[string]int) int {
 			return typeMap[prefix]
 		}
 	}
-
 	return 0
 }
 
 func fileExistsInDB(db *sql.DB, path string) (bool, error) {
 	var exists int
-	err := db.QueryRow(`SELECT COUNT(1) FROM files WHERE path = :1`, path).Scan(&exists)
-	if err != nil {
-		return false, err
-	}
-	return exists > 0, nil
+	err := db.QueryRow(`SELECT COUNT(1) FROM ORA_BANK.ACH_ARCHIVOS_REPROCESO WHERE ARCHIVO = :1`, path).Scan(&exists)
+	return exists > 0, err
 }
 
-func insertFile(db *sql.DB, name, path string, size int64, modTime time.Time, typeID int) {
+func insertFile(db *sql.DB, name string, modTime time.Time, typeID int) {
 	_, err := db.Exec(
-		`INSERT INTO files (name, path, size, mod_time, type_id) VALUES (:1, :2, :3, :4, :5)`,
-		name, path, size, modTime, typeID,
+		`INSERT INTO ORA_BANK.ACH_ARCHIVOS_REPROCESO (ARCHIVO, ID_TIPO_ARCHIVO_REPROCESO, TIEMPO_REGISTRO) VALUES (:1, :2, :3)`,
+		name, typeID, modTime,
 	)
 	if err != nil {
 		log.Printf("Error insertando archivo %s: %v", name, err)
